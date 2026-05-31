@@ -150,6 +150,8 @@ def test_get_newest_commit_hf_falls_back_to_offline_on_connect_error(monkeypatch
 
 def test_check_commit_hf_returns_false_when_upstream_request_fails(monkeypatch, tmp_path):
     app = _make_app(tmp_path, offline=False)
+    repo_utils._CHECK_COMMIT_CACHE.clear()
+    repo_utils._CHECK_COMMIT_INFLIGHT.clear()
 
     class FakeAsyncClient:
         async def __aenter__(self):
@@ -166,3 +168,40 @@ def test_check_commit_hf_returns_false_when_upstream_request_fails(monkeypatch, 
     ok = asyncio.run(repo_utils.check_commit_hf(app, "models", "team", "demo", commit="main"))
 
     assert ok is False
+
+
+def test_check_commit_hf_coalesces_concurrent_calls(monkeypatch, tmp_path):
+    app = _make_app(tmp_path, offline=False)
+    repo_utils._CHECK_COMMIT_CACHE.clear()
+    repo_utils._CHECK_COMMIT_INFLIGHT.clear()
+    calls = {"count": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, *args, **kwargs):
+            calls["count"] += 1
+            await asyncio.sleep(0.05)
+            return FakeResponse()
+
+    monkeypatch.setattr(repo_utils.httpx, "AsyncClient", FakeAsyncClient)
+
+    async def run_many():
+        return await asyncio.gather(
+            *[
+                repo_utils.check_commit_hf(app, "models", "team", "demo", commit="main")
+                for _ in range(12)
+            ]
+        )
+
+    results = asyncio.run(run_many())
+
+    assert results == [True] * 12
+    assert calls["count"] == 1
