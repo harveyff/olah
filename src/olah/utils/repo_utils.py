@@ -134,10 +134,11 @@ async def check_commit_hf(
                 commit=commit,
                 authorization=authorization,
             )
-            _CHECK_COMMIT_CACHE[key] = (
-                result,
-                time.monotonic() + _check_commit_cache_ttl(result),
-            )
+            if result:
+                _CHECK_COMMIT_CACHE[key] = (
+                    True,
+                    time.monotonic() + _check_commit_cache_ttl(True),
+                )
             return result
         finally:
             _CHECK_COMMIT_INFLIGHT.pop(key, None)

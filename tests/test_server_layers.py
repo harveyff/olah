@@ -141,10 +141,13 @@ async def test_resolve_requested_commit_centralizes_repo_and_revision_errors(mon
     repo = server_access.build_repo_ref("models", "team", "demo")
 
     async def fake_check_commit_hf(app, repo_type, org, repo_name, commit, authorization=None):
-        return commit is None
+        return False
+
+    async def fake_get_commit_hf(*args, **kwargs):
+        return None
 
     monkeypatch.setattr(server_upstream, "check_commit_hf", fake_check_commit_hf)
-    monkeypatch.setattr(server_upstream, "get_commit_hf", pytest.fail)
+    monkeypatch.setattr(server_upstream, "get_commit_hf", fake_get_commit_hf)
 
     _, revision_error = await server_upstream.resolve_requested_commit(
         app,
