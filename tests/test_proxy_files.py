@@ -477,8 +477,8 @@ async def test_file_realtime_stream_rejects_unsatisfiable_ranges(monkeypatch, tm
         save_path=str(tmp_path / "save"),
         head_path=str(tmp_path / "head"),
         url="https://mirror.example/file.bin",
-        request=_make_request("GET", headers={"range": "bytes=5-9", "host": "mirror.example"}),
-        method="GET",
+        request=_make_request("HEAD", headers={"range": "bytes=5-9", "host": "mirror.example"}),
+        method="HEAD",
         allow_cache=False,
         commit="abc123",
     )

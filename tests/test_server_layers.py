@@ -360,7 +360,7 @@ async def test_meta_proxy_common_checks_visibility_before_local_mirror(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_file_get_common_checks_visibility_before_local_mirror(monkeypatch):
+async def test_file_get_common_checks_access_before_local_mirror(monkeypatch):
     from fastapi import Request
 
     app = _make_app()
@@ -379,10 +379,10 @@ async def test_file_get_common_checks_visibility_before_local_mirror(monkeypatch
         "server": ("127.0.0.1", 18090),
     }
 
-    async def fake_ensure_repo_visibility(app, repo, authorization):
+    async def fake_ensure_repo_access(app, repo):
         return errors.error_repo_not_found()
 
-    monkeypatch.setattr(server_file_routes, "ensure_repo_visibility", fake_ensure_repo_visibility)
+    monkeypatch.setattr(server_file_routes, "ensure_repo_access", fake_ensure_repo_access)
     monkeypatch.setattr(server_file_routes, "load_local_mirror_payload", pytest.fail)
 
     response = await server_file_routes.file_get_common(

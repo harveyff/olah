@@ -684,12 +684,19 @@ async def _file_realtime_stream(
         status_code = 200
         response_headers["content-length"] = str(file_size)
     elif len(all_ranges) == 0:
-        response_headers["content-range"] = f"bytes */{file_size}"
-        return ProxyResult(
-            status_code=416,
-            headers=response_headers,
-            body=single_chunk_body(b""),
-        )
+        if method.lower() == "get":
+            # Stale resume offsets from download clients should not hard-fail; serve the full file.
+            range_header = None
+            status_code = 200
+            response_headers["content-length"] = str(file_size)
+            response_headers.pop("content-range", None)
+        else:
+            response_headers["content-range"] = f"bytes */{file_size}"
+            return ProxyResult(
+                status_code=416,
+                headers=response_headers,
+                body=single_chunk_body(b""),
+            )
     elif len(all_ranges) == 1:
         start_pos, end_pos = all_ranges[0]
         status_code = 206
