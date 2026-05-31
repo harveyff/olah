@@ -8,6 +8,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, List, Literal, Optional, Tuple
@@ -17,17 +18,21 @@ from urllib.parse import urlparse, urljoin
 
 from olah.constants import (
     CHUNK_SIZE,
-    WORKER_API_TIMEOUT,
-    HUGGINGFACE_HEADER_X_REPO_COMMIT,
-    HUGGINGFACE_HEADER_X_LINKED_ETAG,
-    HUGGINGFACE_HEADER_X_LINKED_SIZE,
-    ORIGINAL_LOC,
+    LFS_FILE_BLOCK,
+    OLAH_REMOTE_RETRY_MAX,
 )
 from olah.cache.olah_cache import OlahCache
 from olah.errors import error_entry_not_found, error_proxy_invalid_data, error_proxy_timeout
 from olah.proxy.pathsinfo import pathsinfo_generator
 from olah.utils.cache_utils import read_cache_request, write_cache_request
 from olah.utils.disk_utils import touch_file_access_time
+from olah.utils.http_utils import (
+    create_stream_client,
+    is_transient_upstream_error,
+    is_transient_upstream_status,
+    worker_api_timeout,
+    worker_stream_timeout,
+)
 from olah.utils.url_utils import (
     RemoteInfo,
     add_query_param,
@@ -41,9 +46,16 @@ from olah.utils.url_utils import (
 from olah.utils.repo_utils import get_org_repo
 from olah.utils.rule_utils import check_cache_rules_hf
 from olah.utils.file_utils import make_dirs
-from olah.constants import CHUNK_SIZE, LFS_FILE_BLOCK, WORKER_API_TIMEOUT
+from olah.constants import (
+    HUGGINGFACE_HEADER_X_REPO_COMMIT,
+    HUGGINGFACE_HEADER_X_LINKED_ETAG,
+    HUGGINGFACE_HEADER_X_LINKED_SIZE,
+    ORIGINAL_LOC,
+)
 from olah.utils.zip_utils import Decompressor, decompress_data
 from olah.proxy.result import ProxyResult, single_chunk_body
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -153,7 +165,11 @@ async def _write_block_safely(
 
 
 async def _get_file_range_from_cache(
-    cache_file: OlahCache, start_pos: int, end_pos: int
+    cache_file: OlahCache,
+    start_pos: int,
+    end_pos: int,
+    client: Optional[httpx.AsyncClient] = None,
+    remote_info: Optional[RemoteInfo] = None,
 ):
     start_block = start_pos // cache_file._get_block_size()
     end_block = (end_pos - 1) // cache_file._get_block_size()
@@ -165,6 +181,23 @@ async def _get_file_range_from_cache(
         if not cache_file.has_block(cur_block):
             raise Exception("Unknown exception: read block which has not been cached.")
         raw_block = await cache_file.read_block(cur_block)
+        if raw_block is None:
+            if client is None or remote_info is None:
+                raise Exception(
+                    f"Corrupt cache block {cur_block} invalidated and no remote fallback is configured."
+                )
+            refetch_start = max(start_pos, block_start_pos)
+            refetch_end = min(end_pos, block_end_pos)
+            async for chunk in _get_file_range_from_remote(
+                client,
+                remote_info,
+                cache_file,
+                refetch_start,
+                refetch_end,
+            ):
+                yield chunk
+            cur_pos = refetch_end
+            continue
         chunk = raw_block[
             max(start_pos, block_start_pos)
             - block_start_pos : min(end_pos, block_end_pos)
@@ -184,10 +217,64 @@ async def _get_file_range_from_remote(
     start_pos: int,
     end_pos: int,
 ):
+    expected_len = end_pos - start_pos
+    last_err: Optional[BaseException] = None
+    retry_max = int(os.getenv("OLAH_REMOTE_RETRY_MAX", str(OLAH_REMOTE_RETRY_MAX)))
+
+    for attempt in range(1, retry_max + 1):
+        chunk_bytes = 0
+        try:
+            async for chunk in _get_file_range_from_remote_once(
+                client,
+                remote_info,
+                cache_file,
+                start_pos,
+                end_pos,
+            ):
+                chunk_bytes += len(chunk)
+                yield chunk
+            if chunk_bytes != expected_len:
+                raise Exception(
+                    f"The content of the response is incomplete. "
+                    f"File size: {cache_file._get_file_size()}. "
+                    f"Start-end: {start_pos}-{end_pos}. "
+                    f"Expected: {expected_len}. Accepted: {chunk_bytes}"
+                )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_err = exc
+            if attempt >= retry_max or not is_transient_upstream_error(exc):
+                raise
+            wait = min(2 ** (attempt - 1), 30)
+            logger.warning(
+                "Upstream range %d-%d failed (attempt %d/%d): %s; retry in %ss",
+                start_pos,
+                end_pos,
+                attempt,
+                retry_max,
+                exc,
+                wait,
+            )
+            await asyncio.sleep(wait)
+
+    if last_err is not None:
+        raise last_err
+
+
+async def _get_file_range_from_remote_once(
+    client: httpx.AsyncClient,
+    remote_info: RemoteInfo,
+    cache_file: OlahCache,
+    start_pos: int,
+    end_pos: int,
+):
     headers = {}
     if remote_info.headers.get("authorization", None) is not None:
         headers["authorization"] = remote_info.headers.get("authorization", None)
     headers["range"] = f"bytes={start_pos}-{end_pos - 1}"
+    headers["accept-encoding"] = "identity"
 
     chunk_bytes = 0
     decompressor: Optional[Decompressor] = None
@@ -195,19 +282,31 @@ async def _get_file_range_from_remote(
         method=remote_info.method,
         url=remote_info.url,
         headers=headers,
-        timeout=WORKER_API_TIMEOUT,
+        timeout=worker_stream_timeout(),
         follow_redirects=True,
     ) as response:
         status_code = response.status_code
-    
+
         if status_code == 429:
             raise Exception("Too many requests in a given amount of time.")
-        
+        if status_code not in (200, 206):
+            if is_transient_upstream_status(status_code):
+                raise httpx.TransportError(f"Upstream returned HTTP {status_code}")
+            body_snippet = (await response.aread())[:256]
+            raise Exception(
+                f"Upstream returned HTTP {status_code} for range {start_pos}-{end_pos - 1}: {body_snippet!r}"
+            )
+
         is_compressed = "content-encoding" in response.headers
         if is_compressed:
             decompressor = Decompressor(response.headers["content-encoding"].split(","))
-        
-        async for raw_chunk in response.aiter_raw():
+
+        if hasattr(response, "aiter_bytes"):
+            chunk_source = response.aiter_bytes(CHUNK_SIZE)
+        else:
+            chunk_source = response.aiter_raw()
+
+        async for raw_chunk in chunk_source:
             if not raw_chunk:
                 continue
             if is_compressed and decompressor is not None:
@@ -223,7 +322,6 @@ async def _get_file_range_from_remote(
         else:
             response_content_length = int(response.headers["content-length"])
 
-    # Post check
     if end_pos - start_pos != response_content_length:
         raise Exception(
             f"The content of the response is incomplete. File size: {cache_file._get_file_size()}. Start-end: {start_pos}-{end_pos}. Expected-{end_pos - start_pos}. Accepted-{response_content_length}"
@@ -241,11 +339,14 @@ async def _file_chunk_get(
     allow_cache: bool,
     file_size: int,
 ):
+    cache_block_size = getattr(
+        app.state.app_settings.config, "cache_block_size", LFS_FILE_BLOCK
+    )
     # Redirect Chunks
     if os.path.exists(save_path):
         cache_file = OlahCache(save_path)
     else:
-        cache_file = OlahCache.create(save_path)
+        cache_file = OlahCache.create(save_path, block_size=cache_block_size)
         cache_file.resize(file_size=file_size)
     
     # Refresh access time
@@ -271,6 +372,8 @@ async def _file_chunk_get(
                         cache_file,
                         range_start_pos,
                         range_end_pos,
+                        client=client,
+                        remote_info=RemoteInfo(method, url, headers),
                     )
 
                 cur_pos = range_start_pos
@@ -387,9 +490,13 @@ async def _file_chunk_head(
             method=method,
             url=url,
             headers=headers,
-            timeout=WORKER_API_TIMEOUT,
+            timeout=worker_api_timeout(),
         ) as response:
-            async for raw_chunk in response.aiter_raw():
+            async for raw_chunk in (
+                response.aiter_bytes(CHUNK_SIZE)
+                if hasattr(response, "aiter_bytes")
+                else response.aiter_raw()
+            ):
                 if not raw_chunk:
                     continue
                 yield raw_chunk
@@ -414,12 +521,12 @@ async def _resource_etag(hf_url: str, authorization: Optional[str]=None, offline
                     method="head",
                     url=hf_url,
                     headers=etag_headers,
-                    timeout=WORKER_API_TIMEOUT,
+                    timeout=worker_api_timeout(),
                 )
-            if "etag" in response.headers:
-                ret_etag = response.headers["etag"]
-            else:
-                ret_etag = f'"{content_hash[:32]}-10"'
+                if "etag" in response.headers:
+                    ret_etag = response.headers["etag"]
+                else:
+                    ret_etag = f'"{content_hash[:32]}-10"'
         except httpx.HTTPError:
             ret_etag = None
     return ret_etag
@@ -444,7 +551,7 @@ async def _remote_file_metadata(
                 method="HEAD",
                 url=hf_url,
                 headers=headers,
-                timeout=WORKER_API_TIMEOUT,
+                timeout=worker_api_timeout(),
                 follow_redirects=True,
             )
     except (httpx.HTTPError, ValueError):
@@ -597,7 +704,7 @@ async def _file_realtime_stream(
         )
 
     async def body_iter() -> AsyncIterator[bytes]:
-        async with httpx.AsyncClient() as client:
+        async with create_stream_client() as client:
             if method.lower() == "get":
                 if range_header is None:
                     async for each_chunk in _stream_single_range(

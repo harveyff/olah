@@ -6,6 +6,8 @@ import pytest
 from olah.cache.bitset import Bitset
 from olah import errors
 from olah.mirror.meta import RepoMeta
+from olah.proxy import files as proxy_files
+from olah.proxy.files import RemoteInfo
 
 pytest.importorskip("portalocker")
 
@@ -90,6 +92,118 @@ def test_error_responses_return_expected_status_and_headers():
     assert json.loads(revision_missing.body) == {"error": "Invalid rev id: abc123"}
     assert proxy_timeout.status_code == 504
     assert proxy_timeout.headers["x-error-message"] == "Proxy Timeout"
+
+
+@pytest.mark.asyncio
+async def test_olah_cache_invalidates_wrong_decompressed_length(tmp_path):
+    cache = OlahCache.create(str(tmp_path / "cache"))
+    cache.resize(16)
+
+    payload = b"abcd" + b"\x00" * (cache._get_block_size() - 4)
+    await cache.write_block(0, payload)
+
+    block_path = tmp_path / "cache" / "blocks" / "block_00000000.bin"
+    assert block_path.exists()
+
+    # Force a truncated gzip payload that still has a valid header.
+    import gzip
+
+    block_path.write_bytes(gzip.compress(b"ab"))
+
+    result = await cache.read_block(0)
+    assert result is None
+    assert cache.has_block(0) is False
+    cache.close()
+
+
+@pytest.mark.asyncio
+async def test_olah_cache_invalidates_corrupt_gzip_block(tmp_path):
+    cache = OlahCache.create(str(tmp_path / "cache"))
+    cache.resize(16)
+
+    block_path = tmp_path / "cache" / "blocks" / "block_00000000.bin"
+    block_path.write_bytes(b"not-valid-gzip")
+
+    assert cache.has_block(0) is True
+    result = await cache.read_block(0)
+    assert result is None
+    assert cache.has_block(0) is False
+    cache.close()
+
+
+@pytest.mark.asyncio
+async def test_olah_cache_write_block_skips_existing(tmp_path):
+    cache = OlahCache.create(str(tmp_path / "cache"))
+    cache.resize(16)
+
+    first = b"abcd" + b"\x00" * (cache._get_block_size() - 4)
+    second = b"efgh" + b"\x00" * (cache._get_block_size() - 4)
+    await cache.write_block(0, first)
+    await cache.write_block(0, second)
+
+    restored = await cache.read_block(0)
+    assert restored[:4] == b"abcd"
+    cache.close()
+
+
+@pytest.mark.asyncio
+async def test_get_file_range_from_cache_refetches_invalidated_block():
+    class FakeCache:
+        def _get_block_size(self):
+            return 4
+
+        def _get_file_size(self):
+            return 8
+
+        def has_block(self, idx):
+            return idx in {0, 1}
+
+        async def read_block(self, idx):
+            if idx == 1:
+                return None
+            return [b"ABCD", b"EFGH"][idx]
+
+    remote_payload = b"WXYZ"
+
+    class FakeResponse:
+        status_code = 206
+        headers = {"content-length": str(len(remote_payload))}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_raw(self):
+            yield remote_payload
+
+    class FakeClient:
+        def stream(self, **kwargs):
+            return FakeResponse()
+
+    class FakeCacheSize:
+        def _get_file_size(self):
+            return len(remote_payload)
+
+    remote_info = RemoteInfo(
+        method="GET",
+        url="https://huggingface.co/file.bin",
+        headers={},
+    )
+
+    chunks = [
+        chunk
+        async for chunk in proxy_files._get_file_range_from_cache(
+            FakeCache(),
+            start_pos=0,
+            end_pos=8,
+            client=FakeClient(),
+            remote_info=remote_info,
+        )
+    ]
+
+    assert chunks == [b"ABCD", remote_payload]
 
 
 def test_repo_meta_to_dict_exposes_current_field_values():

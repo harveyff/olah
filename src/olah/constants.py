@@ -7,10 +7,18 @@
 
 import os
 
-
+# Legacy scalar kept for imports that pass timeout=WORKER_API_TIMEOUT to httpx.
+# Prefer olah.utils.http_utils.worker_api_timeout() / worker_stream_timeout().
 WORKER_API_TIMEOUT = 15
-CHUNK_SIZE = 4096
+# Larger read buffer improves throughput for upstream streaming.
+CHUNK_SIZE = 256 * 1024
+# Align with huggingface_hub LFS chunk size and common Range clients (64 MiB).
 LFS_FILE_BLOCK = 64 * 1024 * 1024
+
+# Cache tuning (also configurable via configs.toml [performance]).
+OLAH_CACHE_BLOCK_SIZE = int(os.getenv("OLAH_CACHE_BLOCK_SIZE", str(LFS_FILE_BLOCK)))
+OLAH_CACHE_GZIP_LEVEL = int(os.getenv("OLAH_CACHE_GZIP_LEVEL", "1"))
+OLAH_REMOTE_RETRY_MAX = int(os.getenv("OLAH_REMOTE_RETRY_MAX", "5"))
 
 DEFAULT_LOGGER_DIR = "./logs"
 OLAH_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
