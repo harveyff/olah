@@ -18,13 +18,16 @@ from urllib.parse import urljoin
 import httpx
 from olah.constants import WORKER_API_TIMEOUT
 from olah.utils.cache_utils import read_cache_request
+from olah.utils.http_utils import create_api_client, is_transient_upstream_error
 
 
 _CHECK_COMMIT_CACHE: Dict[Tuple[str, str, str, str], Tuple[bool, float]] = {}
 _CHECK_COMMIT_INFLIGHT: Dict[Tuple[str, str, str, str], asyncio.Task] = {}
+_GET_COMMIT_CACHE: Dict[Tuple[str, str, str, str], Tuple[str, float]] = {}
+_GET_COMMIT_INFLIGHT: Dict[Tuple[str, str, str, str], asyncio.Task[Optional[str]]] = {}
 
 
-def _check_commit_cache_key(
+def _commit_cache_key(
     repo_type: Optional[str],
     org_repo: str,
     commit: Optional[str],
@@ -33,6 +36,23 @@ def _check_commit_cache_key(
     commit_key = commit if commit is not None else "__repo__"
     auth_key = "auth" if authorization else "noauth"
     return (str(repo_type), org_repo, commit_key, auth_key)
+
+
+def _check_commit_cache_key(
+    repo_type: Optional[str],
+    org_repo: str,
+    commit: Optional[str],
+    authorization: Optional[str],
+) -> Tuple[str, str, str, str]:
+    return _commit_cache_key(repo_type, org_repo, commit, authorization)
+
+
+def _get_commit_cache_ttl() -> float:
+    raw = os.getenv("OLAH_GET_COMMIT_CACHE_TTL", "300")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
 
 
 def _check_commit_cache_ttl(result: bool) -> float:
@@ -69,12 +89,11 @@ async def _check_commit_hf_upstream(
     if authorization is not None:
         headers["authorization"] = authorization
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_api_client() as client:
             response = await client.request(
                 method="HEAD",
                 url=url,
                 headers=headers,
-                timeout=WORKER_API_TIMEOUT,
             )
             status_code = response.status_code
     except httpx.HTTPError:
@@ -347,6 +366,49 @@ async def get_newest_commit_hf(
         return await get_newest_commit_hf_offline(app, repo_type, org, repo)
 
 
+async def _get_commit_hf_upstream(
+    app,
+    repo_type: Optional[Literal["models", "datasets", "spaces"]],
+    org: Optional[str],
+    repo: str,
+    commit: str,
+    authorization: Optional[str] = None,
+) -> Optional[str]:
+    org_repo = get_org_repo(org, repo)
+    url = urljoin(
+        app.state.app_settings.config.hf_url_base(),
+        f"/api/{repo_type}/{org_repo}/revision/{commit}",
+    )
+    headers = {}
+    if authorization is not None:
+        headers["authorization"] = authorization
+    async with create_api_client() as client:
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        if response.status_code not in [200, 307]:
+            return None
+        obj = json.loads(response.text)
+    return obj.get("sha", None)
+
+
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(3),
+    retry=tenacity.retry_if_exception(is_transient_upstream_error),
+    wait=tenacity.wait_exponential(multiplier=0.25, min=0.25, max=2.0),
+    reraise=True,
+)
+async def _get_commit_hf_upstream_with_retry(
+    app,
+    repo_type: Optional[Literal["models", "datasets", "spaces"]],
+    org: Optional[str],
+    repo: str,
+    commit: str,
+    authorization: Optional[str] = None,
+) -> Optional[str]:
+    return await _get_commit_hf_upstream(
+        app, repo_type, org, repo, commit=commit, authorization=authorization
+    )
+
+
 async def get_commit_hf_offline(
     app,
     repo_type: Optional[Literal["models", "datasets", "spaces"]],
@@ -390,39 +452,51 @@ async def get_commit_hf(
     """
     Retrieves the commit SHA for a given repository and commit from the Hugging Face API.
 
-    Args:
-        app: The application instance.
-        repo_type: Optional. The type of repository ("models", "datasets", or "spaces").
-        org: Optional. The organization name for the repository.
-        repo: The name of the repository.
-        commit: The commit identifier.
-        authorization: Optional. The authorization token for accessing the API.
-
-    Returns:
-        The commit SHA as a string, or None if the commit cannot be retrieved.
-
-    Raises:
-        This function does not raise any explicit exceptions but may propagate exceptions from underlying functions.
+    Concurrent callers for the same repo/commit share one upstream GET and cache the
+    resolved SHA briefly to avoid burst 401s during whole-repo downloads.
     """
-    org_repo = get_org_repo(org, repo)
-    url = urljoin(
-        app.state.app_settings.config.hf_url_base(),
-        f"/api/{repo_type}/{org_repo}/revision/{commit}",
-    )
     if app.state.app_settings.config.offline:
         return await get_commit_hf_offline(app, repo_type, org, repo, commit)
-    try:
-        headers = {}
-        if authorization is not None:
-            headers["authorization"] = authorization
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url, headers=headers, timeout=WORKER_API_TIMEOUT, follow_redirects=True
-            )
-            if response.status_code not in [200, 307]:
-                return await get_commit_hf_offline(app, repo_type, org, repo, commit)
-            obj = json.loads(response.text)
-        return obj.get("sha", None)
-    except (httpx.HTTPError, ValueError, OSError):
-        return await get_commit_hf_offline(app, repo_type, org, repo, commit)
+
+    org_repo = get_org_repo(org, repo)
+    key = _commit_cache_key(repo_type, org_repo, commit, authorization)
+    now = time.monotonic()
+
+    cached = _GET_COMMIT_CACHE.get(key)
+    if cached is not None:
+        sha, expires_at = cached
+        if now < expires_at:
+            return sha
+
+    inflight = _GET_COMMIT_INFLIGHT.get(key)
+    if inflight is not None:
+        return await inflight
+
+    async def _run() -> Optional[str]:
+        try:
+            try:
+                sha = await _get_commit_hf_upstream_with_retry(
+                    app,
+                    repo_type,
+                    org,
+                    repo,
+                    commit=commit,
+                    authorization=authorization,
+                )
+            except (httpx.HTTPError, ValueError, OSError):
+                sha = None
+            if sha is None:
+                sha = await get_commit_hf_offline(app, repo_type, org, repo, commit)
+            if sha is not None:
+                _GET_COMMIT_CACHE[key] = (
+                    sha,
+                    time.monotonic() + _get_commit_cache_ttl(),
+                )
+            return sha
+        finally:
+            _GET_COMMIT_INFLIGHT.pop(key, None)
+
+    task = asyncio.create_task(_run())
+    _GET_COMMIT_INFLIGHT[key] = task
+    return await task
 

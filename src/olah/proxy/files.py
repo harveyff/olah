@@ -485,23 +485,48 @@ async def _file_chunk_head(
     allow_cache: bool,
     file_size: int,
 ):
-    if not app.state.app_settings.config.offline:
-        async with client.stream(
-            method=method,
-            url=url,
-            headers=headers,
-            timeout=worker_api_timeout(),
-        ) as response:
-            async for raw_chunk in (
-                response.aiter_bytes(CHUNK_SIZE)
-                if hasattr(response, "aiter_bytes")
-                else response.aiter_raw()
-            ):
-                if not raw_chunk:
-                    continue
-                yield raw_chunk
-    else:
+    if app.state.app_settings.config.offline:
         yield b""
+        return
+
+    retry_max = int(os.getenv("OLAH_REMOTE_RETRY_MAX", str(OLAH_REMOTE_RETRY_MAX)))
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, retry_max + 1):
+        try:
+            async with client.stream(
+                method=method,
+                url=url,
+                headers=headers,
+                timeout=worker_api_timeout(),
+            ) as response:
+                async for raw_chunk in (
+                    response.aiter_bytes(CHUNK_SIZE)
+                    if hasattr(response, "aiter_bytes")
+                    else response.aiter_raw()
+                ):
+                    if not raw_chunk:
+                        continue
+                    yield raw_chunk
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_err = exc
+            if attempt >= retry_max or not is_transient_upstream_error(exc):
+                raise
+            wait = min(2 ** (attempt - 1), 30)
+            logger.warning(
+                "Upstream HEAD %s failed (attempt %d/%d): %s; retry in %ss",
+                url,
+                attempt,
+                retry_max,
+                exc,
+                wait,
+            )
+            await asyncio.sleep(wait)
+
+    if last_err is not None:
+        raise last_err
 
 
 async def _resource_etag(hf_url: str, authorization: Optional[str]=None, offline: bool = False) -> Optional[str]:
