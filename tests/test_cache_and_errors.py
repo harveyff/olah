@@ -1,5 +1,6 @@
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -144,6 +145,123 @@ async def test_olah_cache_write_block_skips_existing(tmp_path):
     restored = await cache.read_block(0)
     assert restored[:4] == b"abcd"
     cache.close()
+
+
+@pytest.mark.asyncio
+async def test_olah_cache_write_block_overwrite_replaces_existing(tmp_path):
+    cache = OlahCache.create(str(tmp_path / "cache"))
+    cache.resize(16)
+
+    first = b"abcd" + b"\x00" * (cache._get_block_size() - 4)
+    second = b"efgh" + b"\x00" * (cache._get_block_size() - 4)
+    await cache.write_block(0, first)
+    await cache.write_block(0, second, overwrite=True)
+
+    restored = await cache.read_block(0)
+    assert restored[:4] == b"efgh"
+    cache.close()
+
+
+@pytest.mark.asyncio
+async def test_olah_cache_invalidate_blocks_in_range(tmp_path):
+    cache = OlahCache.create(str(tmp_path / "cache"))
+    cache.resize(cache._get_block_size() * 3)
+
+    for idx in range(3):
+        payload = bytes([idx + 65]) * 4 + b"\x00" * (cache._get_block_size() - 4)
+        await cache.write_block(idx, payload)
+
+    cache.invalidate_blocks_in_range(
+        cache._get_block_size(),
+        cache._get_block_size() * 2,
+        "test invalidate middle block",
+    )
+
+    assert cache.has_block(0) is True
+    assert cache.has_block(1) is False
+    assert cache.has_block(2) is True
+    cache.close()
+
+
+def test_should_persist_block_rejects_partial_non_terminal():
+    class FakeCache:
+        block_size = 8
+        file_size = 24
+
+        def _get_block_size(self):
+            return self.block_size
+
+        def _get_block_number(self):
+            return 3
+
+        def is_terminal_block(self, block_index):
+            return block_index == 2
+
+        def _expected_decompressed_len(self, block_index):
+            return self.block_size
+
+    cache = FakeCache()
+    assert proxy_files._should_persist_block(cache, 0, 8) is True
+    assert proxy_files._should_persist_block(cache, 0, 4) is False
+    assert proxy_files._should_persist_block(cache, 2, 8) is True
+    assert proxy_files._should_persist_block(cache, 2, 4) is False
+
+
+@pytest.mark.asyncio
+async def test_file_chunk_get_does_not_cache_partial_non_terminal_block(tmp_path):
+    block_size = 16
+    save_path = tmp_path / "repos" / "files" / "models" / "team" / "demo" / "resolve" / "main" / "part.bin"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    file_size = block_size * 2
+    payload = b"A" * block_size + b"B" * block_size
+    partial_len = block_size // 2
+
+    class FakeResponse:
+        status_code = 206
+        headers = {"content-length": str(partial_len)}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_raw(self):
+            yield payload[:partial_len]
+
+    class FakeClient:
+        def stream(self, **kwargs):
+            return FakeResponse()
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            app_settings=SimpleNamespace(
+                config=SimpleNamespace(
+                    cache_block_size=block_size,
+                    repos_path=str(tmp_path / "repos"),
+                )
+            )
+        )
+    )
+
+    chunks = [
+        chunk
+        async for chunk in proxy_files._file_chunk_get(
+            app=app,
+            save_path=str(save_path),
+            head_path=str(tmp_path / "head"),
+            client=FakeClient(),
+            method="GET",
+            url="https://huggingface.co/part.bin",
+            headers={"range": f"bytes=0-{partial_len - 1}"},
+            allow_cache=True,
+            file_size=file_size,
+        )
+    ]
+
+    assert b"".join(chunks) == payload[:partial_len]
+    assert not (save_path / "blocks" / "block_00000000.bin").exists()
+    assert not (save_path / "blocks" / "block_00000001.bin").exists()
 
 
 @pytest.mark.asyncio

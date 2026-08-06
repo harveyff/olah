@@ -19,6 +19,17 @@ LFS_FILE_BLOCK = 64 * 1024 * 1024
 OLAH_CACHE_BLOCK_SIZE = int(os.getenv("OLAH_CACHE_BLOCK_SIZE", str(LFS_FILE_BLOCK)))
 OLAH_CACHE_GZIP_LEVEL = int(os.getenv("OLAH_CACHE_GZIP_LEVEL", "1"))
 OLAH_REMOTE_RETRY_MAX = int(os.getenv("OLAH_REMOTE_RETRY_MAX", "5"))
+# Remote ranges larger than this are split at block boundaries before fetch (64 MiB default).
+OLAH_REMOTE_FETCH_BLOCK_ALIGN = os.getenv("OLAH_REMOTE_FETCH_BLOCK_ALIGN", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+OLAH_CACHE_SHA256_VERIFY = os.getenv("OLAH_CACHE_SHA256_VERIFY", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 DEFAULT_LOGGER_DIR = "./logs"
 OLAH_CODE_DIR = os.path.dirname(os.path.abspath(__file__))

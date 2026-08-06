@@ -6,6 +6,7 @@
 # https://opensource.org/licenses/MIT.
 
 import asyncio
+import hashlib
 import logging
 import lzma
 import mmap
@@ -149,6 +150,8 @@ class OlahCache(object):
         # Path
         self._meta_path = os.path.join(path, "meta.bin")
         self._data_path = os.path.join(path, "blocks/block_${block_index}.bin")
+        # Incremented when an in-flight download must reset block assembly state (upstream retry).
+        self._stream_reset_nonce: int = 0
 
         self.open(path, block_size=block_size)
 
@@ -287,6 +290,52 @@ class OlahCache(object):
     def _block_path(self, block_index: int) -> str:
         return string.Template(self._data_path).substitute(block_index=f"{block_index:0>8}")
 
+    def is_terminal_block(self, block_index: int) -> bool:
+        return block_index == self._get_block_number() - 1
+
+    def invalidate_blocks_in_range(self, start_pos: int, end_pos: int, reason: str) -> None:
+        if start_pos >= end_pos:
+            return
+        block_size = self._get_block_size()
+        start_block = start_pos // block_size
+        end_block = (end_pos - 1) // block_size
+        for block_index in range(start_block, end_block + 1):
+            self._invalidate_block(block_index, reason)
+
+    def request_stream_reset(self, start_pos: int, end_pos: int, reason: str) -> None:
+        self.invalidate_blocks_in_range(start_pos, end_pos, reason)
+        self._stream_reset_nonce += 1
+
+    def is_complete(self) -> bool:
+        if not self.is_open or self.header is None:
+            return False
+        for block_index in range(self._get_block_number()):
+            if not self.has_block(block_index):
+                return False
+        return True
+
+    def invalidate_all_blocks(self, reason: str) -> None:
+        if self.header is None:
+            return
+        for block_index in range(self._get_block_number()):
+            if self.has_block(block_index):
+                self._invalidate_block(block_index, reason)
+        self._stream_reset_nonce += 1
+
+    async def content_sha256(self) -> str:
+        if not self.is_open or self.header is None:
+            raise Exception("Cannot hash a closed cache file.")
+        digest = hashlib.sha256()
+        for block_index in range(self._get_block_number()):
+            if not self.has_block(block_index):
+                raise Exception(f"Cache block {block_index} is missing.")
+            raw_block = await self.read_block(block_index)
+            if raw_block is None:
+                raise Exception(f"Cache block {block_index} could not be read.")
+            expected_len = self._expected_decompressed_len(block_index)
+            digest.update(raw_block[:expected_len])
+        return digest.hexdigest()
+
     def has_block(self, block_index: int) -> bool:
         block_path = self._block_path(block_index)
         if not os.path.exists(block_path):
@@ -381,7 +430,9 @@ class OlahCache(object):
         block = self._pad_block(raw_block)
         return block
 
-    async def write_block(self, block_index: int, block_bytes: bytes) -> None:
+    async def write_block(
+        self, block_index: int, block_bytes: bytes, overwrite: bool = False
+    ) -> None:
         if not self.is_open:
             raise Exception("This file has been closed.")
         
@@ -430,8 +481,12 @@ class OlahCache(object):
         lock_path = block_path + ".write.lock"
 
         with portalocker.Lock(lock_path, "w", timeout=120, flags=portalocker.LOCK_EX):
-            if self.has_block(block_index):
+            if not overwrite and self.has_block(block_index):
                 return
+            if overwrite and self.has_block(block_index):
+                block_path_existing = self._block_path(block_index)
+                if os.path.exists(block_path_existing):
+                    os.remove(block_path_existing)
 
             with tempfile.NamedTemporaryFile(
                 mode="wb",

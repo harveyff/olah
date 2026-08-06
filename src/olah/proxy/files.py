@@ -19,9 +19,12 @@ from urllib.parse import urlparse, urljoin
 from olah.constants import (
     CHUNK_SIZE,
     LFS_FILE_BLOCK,
+    OLAH_CACHE_SHA256_VERIFY,
+    OLAH_REMOTE_FETCH_BLOCK_ALIGN,
     OLAH_REMOTE_RETRY_MAX,
 )
 from olah.cache.olah_cache import OlahCache
+from olah.cache.integrity import lfs_sha256_from_pathsinfo, verify_cache_sha256
 from olah.errors import error_entry_not_found, error_proxy_invalid_data, error_proxy_timeout
 from olah.proxy.pathsinfo import pathsinfo_generator
 from olah.utils.cache_utils import read_cache_request, write_cache_request
@@ -56,6 +59,52 @@ from olah.utils.zip_utils import Decompressor, decompress_data
 from olah.proxy.result import ProxyResult, single_chunk_body
 
 logger = logging.getLogger(__name__)
+
+# One in-flight cache writer per file path — prevents concurrent block assembly races.
+_file_cache_locks: Dict[str, asyncio.Lock] = {}
+_file_cache_locks_guard = asyncio.Lock()
+
+
+async def _acquire_file_cache_lock(save_path: str) -> asyncio.Lock:
+    async with _file_cache_locks_guard:
+        lock = _file_cache_locks.get(save_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            _file_cache_locks[save_path] = lock
+    await lock.acquire()
+    return lock
+
+
+def _should_persist_block(
+    cache_file: OlahCache,
+    block_index: int,
+    raw_block_len: int,
+) -> bool:
+    block_size = cache_file._get_block_size()
+    if raw_block_len == block_size:
+        return True
+    if raw_block_len <= 0:
+        return False
+    if not cache_file.is_terminal_block(block_index):
+        return False
+    expected_len = cache_file._expected_decompressed_len(block_index)
+    return raw_block_len == expected_len
+
+
+def _pad_block_for_write(
+    cache_file: OlahCache, block_index: int, raw_block: bytes
+) -> bytes:
+    block_size = cache_file._get_block_size()
+    if len(raw_block) == block_size:
+        return raw_block
+    if cache_file.is_terminal_block(block_index):
+        expected_len = cache_file._expected_decompressed_len(block_index)
+        if len(raw_block) == expected_len:
+            return raw_block + b"\x00" * (block_size - expected_len)
+    raise ValueError(
+        f"Refusing to persist block {block_index}: len {len(raw_block)} "
+        f"is neither full block ({block_size}) nor a complete terminal block"
+    )
 
 
 @dataclass(frozen=True)
@@ -105,6 +154,21 @@ def get_contiguous_ranges(
     return ranges_and_cache_list
 
 
+def iter_block_bounded_ranges(
+    start_pos: int, end_pos: int, block_size: int
+) -> List[Tuple[int, int]]:
+    """Split [start_pos, end_pos) so each slice spans at most one cache block (<= block_size bytes)."""
+    if start_pos >= end_pos:
+        return []
+    slices: List[Tuple[int, int]] = []
+    pos = start_pos
+    while pos < end_pos:
+        block_end = min(((pos // block_size) + 1) * block_size, end_pos)
+        slices.append((pos, block_end))
+        pos = block_end
+    return slices
+
+
 def get_request_ranges(
     file_size: int, range_header: Optional[str]
 ) -> Tuple[str, List[Tuple[int, int]], Optional[int]]:
@@ -151,14 +215,22 @@ async def _write_block_safely(
     block_index: int,
     raw_block: bytes,
     allow_cache: bool,
+    blocks_written: Optional[set] = None,
 ) -> None:
     if not allow_cache:
         return
+    if not _should_persist_block(cache_file, block_index, len(raw_block)):
+        return
+    padded_block = _pad_block_for_write(cache_file, block_index, raw_block)
     if cache_file.has_block(block_index):
         return
-    write_task = asyncio.create_task(cache_file.write_block(block_index, raw_block))
+    write_task = asyncio.create_task(
+        cache_file.write_block(block_index, padded_block)
+    )
     try:
         await asyncio.shield(write_task)
+        if blocks_written is not None:
+            blocks_written.add(block_index)
     except asyncio.CancelledError:
         await write_task
         raise
@@ -222,7 +294,13 @@ async def _get_file_range_from_remote(
     retry_max = int(os.getenv("OLAH_REMOTE_RETRY_MAX", str(OLAH_REMOTE_RETRY_MAX)))
 
     for attempt in range(1, retry_max + 1):
-        chunk_bytes = 0
+        if attempt > 1:
+            cache_file.request_stream_reset(
+                start_pos,
+                end_pos,
+                f"upstream range retry attempt {attempt}/{retry_max}",
+            )
+        collected = bytearray()
         try:
             async for chunk in _get_file_range_from_remote_once(
                 client,
@@ -231,15 +309,16 @@ async def _get_file_range_from_remote(
                 start_pos,
                 end_pos,
             ):
-                chunk_bytes += len(chunk)
-                yield chunk
-            if chunk_bytes != expected_len:
+                collected.extend(chunk)
+            if len(collected) != expected_len:
                 raise Exception(
                     f"The content of the response is incomplete. "
                     f"File size: {cache_file._get_file_size()}. "
                     f"Start-end: {start_pos}-{end_pos}. "
-                    f"Expected: {expected_len}. Accepted: {chunk_bytes}"
+                    f"Expected: {expected_len}. Accepted: {len(collected)}"
                 )
+            for offset in range(0, len(collected), CHUNK_SIZE):
+                yield bytes(collected[offset : offset + CHUNK_SIZE])
             return
         except asyncio.CancelledError:
             raise
@@ -338,10 +417,14 @@ async def _file_chunk_get(
     headers: Dict[str, str],
     allow_cache: bool,
     file_size: int,
+    expected_lfs_sha256: Optional[str] = None,
 ):
     cache_block_size = getattr(
         app.state.app_settings.config, "cache_block_size", LFS_FILE_BLOCK
     )
+    cache_lock: Optional[asyncio.Lock] = None
+    if allow_cache:
+        cache_lock = await _acquire_file_cache_lock(save_path)
     # Redirect Chunks
     if os.path.exists(save_path):
         cache_file = OlahCache(save_path)
@@ -359,86 +442,127 @@ async def _file_chunk_get(
             # Stream ranges
             for (range_start_pos, range_end_pos), is_remote in ranges_and_cache_list:
                 # range_start_pos is zero-index and range_end_pos is exclusive
-                if is_remote:
-                    generator = _get_file_range_from_remote(
-                        client,
-                        RemoteInfo(method, url, headers),
-                        cache_file,
-                        range_start_pos,
-                        range_end_pos,
+                block_size = cache_file._get_block_size()
+                if is_remote and OLAH_REMOTE_FETCH_BLOCK_ALIGN:
+                    fetch_slices = iter_block_bounded_ranges(
+                        range_start_pos, range_end_pos, block_size
                     )
                 else:
-                    generator = _get_file_range_from_cache(
-                        cache_file,
-                        range_start_pos,
-                        range_end_pos,
-                        client=client,
-                        remote_info=RemoteInfo(method, url, headers),
-                    )
+                    fetch_slices = [(range_start_pos, range_end_pos)]
 
-                cur_pos = range_start_pos
-                stream_cache = bytearray()
-                last_block, last_block_start_pos, last_block_end_pos = get_block_info(
-                    cur_pos, cache_file._get_block_size(), cache_file._get_file_size()
-                )
-                cur_block = last_block
-                try:
-                    async for chunk in generator:
-                        if len(chunk) != 0:
-                            yield bytes(chunk)
-                            stream_cache += chunk
-                            cur_pos += len(chunk)
-
-                        cur_block = cur_pos // cache_file._get_block_size()
-
-                        if cur_block == last_block:
-                            continue
-                        split_pos = last_block_end_pos - max(
-                            last_block_start_pos, range_start_pos
-                        )
-                        raw_block = stream_cache[:split_pos]
-                        stream_cache = stream_cache[split_pos:]
-                        if len(raw_block) == cache_file._get_block_size():
-                            await _write_block_safely(
-                                cache_file,
-                                last_block,
-                                raw_block,
-                                allow_cache,
-                            )
-                        last_block, last_block_start_pos, last_block_end_pos = get_block_info(
-                            cur_pos, cache_file._get_block_size(), cache_file._get_file_size()
-                        )
-                finally:
-                    raw_block = bytes(stream_cache)
-                    if cur_pos == range_end_pos:
-                        final_block = last_block
-                        final_start = last_block_start_pos
-                        final_end = last_block_end_pos
-                        if final_start >= range_start_pos:
-                            expected_len = final_end - final_start
-                            if len(raw_block) == expected_len:
-                                if expected_len < cache_file._get_block_size():
-                                    raw_block += b"\x00" * (
-                                        cache_file._get_block_size() - expected_len
-                                    )
-                                await _write_block_safely(
-                                    cache_file,
-                                    final_block,
-                                    raw_block,
-                                    allow_cache,
-                                )
-
-                if cur_pos != range_end_pos:
+                for sub_start, sub_end in fetch_slices:
                     if is_remote:
-                        raise Exception(
-                            f"The size of remote range ({range_end_pos - range_start_pos}) is different from sent size ({cur_pos - range_start_pos})."
+                        generator = _get_file_range_from_remote(
+                            client,
+                            RemoteInfo(method, url, headers),
+                            cache_file,
+                            sub_start,
+                            sub_end,
                         )
                     else:
-                        raise Exception(
-                            f"The size of cached range ({range_end_pos - range_start_pos}) is different from sent size ({cur_pos - range_start_pos})."
+                        generator = _get_file_range_from_cache(
+                            cache_file,
+                            sub_start,
+                            sub_end,
+                            client=client,
+                            remote_info=RemoteInfo(method, url, headers),
                         )
+
+                    cur_pos = sub_start
+                    stream_cache = bytearray()
+                    stream_reset_nonce = cache_file._stream_reset_nonce
+                    blocks_written: set = set()
+                    last_block, last_block_start_pos, last_block_end_pos = get_block_info(
+                        cur_pos, block_size, cache_file._get_file_size()
+                    )
+                    cur_block = last_block
+                    try:
+                        async for chunk in generator:
+                            if cache_file._stream_reset_nonce != stream_reset_nonce:
+                                stream_reset_nonce = cache_file._stream_reset_nonce
+                                stream_cache = bytearray()
+                                cur_pos = sub_start
+                                blocks_written.clear()
+                                last_block, last_block_start_pos, last_block_end_pos = get_block_info(
+                                    cur_pos,
+                                    block_size,
+                                    cache_file._get_file_size(),
+                                )
+                                cur_block = last_block
+
+                            if len(chunk) != 0:
+                                yield bytes(chunk)
+                                stream_cache += chunk
+                                cur_pos += len(chunk)
+
+                            cur_block = cur_pos // block_size
+
+                            if cur_block == last_block:
+                                continue
+                            split_pos = last_block_end_pos - max(
+                                last_block_start_pos, sub_start
+                            )
+                            raw_block = stream_cache[:split_pos]
+                            stream_cache = stream_cache[split_pos:]
+                            if len(raw_block) == block_size:
+                                await _write_block_safely(
+                                    cache_file,
+                                    last_block,
+                                    raw_block,
+                                    allow_cache,
+                                    blocks_written,
+                                )
+                            last_block, last_block_start_pos, last_block_end_pos = get_block_info(
+                                cur_pos, block_size, cache_file._get_file_size()
+                            )
+                    finally:
+                        raw_block = bytes(stream_cache)
+                        if cur_pos == sub_end:
+                            final_block = last_block
+                            final_start = last_block_start_pos
+                            final_end = last_block_end_pos
+                            if final_start >= sub_start:
+                                expected_len = final_end - final_start
+                                if len(raw_block) == expected_len and _should_persist_block(
+                                    cache_file, final_block, len(raw_block)
+                                ):
+                                    await _write_block_safely(
+                                        cache_file,
+                                        final_block,
+                                        raw_block,
+                                        allow_cache,
+                                        blocks_written,
+                                    )
+
+                    if cur_pos != sub_end:
+                        if is_remote:
+                            for block_index in blocks_written:
+                                cache_file._invalidate_block(
+                                    block_index,
+                                    "incomplete remote segment at end of stream",
+                                )
+                            raise Exception(
+                                f"The size of remote range ({sub_end - sub_start}) is different from sent size ({cur_pos - sub_start})."
+                            )
+                        else:
+                            raise Exception(
+                                f"The size of cached range ({sub_end - sub_start}) is different from sent size ({cur_pos - sub_start})."
+                            )
+
+        if (
+            allow_cache
+            and expected_lfs_sha256
+            and OLAH_CACHE_SHA256_VERIFY
+        ):
+            await verify_cache_sha256(
+                cache_file,
+                expected_lfs_sha256,
+                save_path=save_path,
+            )
     finally:
         cache_file.close()
+        if cache_lock is not None:
+            cache_lock.release()
 
 
 async def _stream_single_range(
@@ -452,6 +576,7 @@ async def _stream_single_range(
     allow_cache: bool,
     file_size: int,
     requested_range: Optional[Tuple[int, int]] = None,
+    expected_lfs_sha256: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
     range_headers = dict(headers)
     if requested_range is None:
@@ -470,6 +595,7 @@ async def _stream_single_range(
         headers=range_headers,
         allow_cache=allow_cache,
         file_size=file_size,
+        expected_lfs_sha256=expected_lfs_sha256,
     ):
         yield chunk
 
@@ -643,6 +769,7 @@ async def _file_realtime_stream(
         request_headers["host"] = urlparse(hf_url).netloc
 
     authorization = request.headers.get("authorization", None)
+    expected_lfs_sha256: Optional[str] = None
     if repo_type is not None and org is not None and repo is not None and file_path is not None and commit is not None:
         generator = await pathsinfo_generator(
             app,
@@ -676,6 +803,8 @@ async def _file_realtime_stream(
         if "size" not in pathinfo:
             return await error_result(error_proxy_timeout())
         file_size = pathinfo["size"]
+        if OLAH_CACHE_SHA256_VERIFY:
+            expected_lfs_sha256 = lfs_sha256_from_pathsinfo(pathinfo)
         etag = await _resource_etag(
             hf_url=hf_url,
             authorization=authorization,
@@ -749,6 +878,7 @@ async def _file_realtime_stream(
                         headers=request_headers,
                         allow_cache=allow_cache,
                         file_size=file_size,
+                        expected_lfs_sha256=expected_lfs_sha256,
                     ):
                         yield each_chunk
                 elif len(all_ranges) == 1:
@@ -763,6 +893,7 @@ async def _file_realtime_stream(
                         allow_cache=allow_cache,
                         file_size=file_size,
                         requested_range=all_ranges[0],
+                        expected_lfs_sha256=expected_lfs_sha256,
                     ):
                         yield each_chunk
                 else:
@@ -779,6 +910,7 @@ async def _file_realtime_stream(
                             allow_cache=allow_cache,
                             file_size=file_size,
                             requested_range=(start_pos, end_pos),
+                            expected_lfs_sha256=expected_lfs_sha256,
                         ):
                             yield each_chunk
                         yield b"\r\n"
